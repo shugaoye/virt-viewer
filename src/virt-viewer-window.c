@@ -41,7 +41,11 @@
 #include "virt-viewer-session.h"
 #include "virt-viewer-app.h"
 #include "virt-viewer-util.h"
-#include "view/autoDrawer.h"
+#include "virt-viewer-timed-revealer.h"
+
+#include "remote-viewer-iso-list-dialog.h"
+
+#define ZOOM_STEP 10
 
 /* Signal handlers for main window (move in a VirtViewerMainWindow?) */
 void virt_viewer_window_menu_view_zoom_out(GtkWidget *menu, VirtViewerWindow *self);
@@ -60,6 +64,7 @@ void virt_viewer_window_menu_file_smartcard_insert(GtkWidget *menu, VirtViewerWi
 void virt_viewer_window_menu_file_smartcard_remove(GtkWidget *menu, VirtViewerWindow *self);
 void virt_viewer_window_menu_view_release_cursor(GtkWidget *menu, VirtViewerWindow *self);
 void virt_viewer_window_menu_preferences_cb(GtkWidget *menu, VirtViewerWindow *self);
+void virt_viewer_window_menu_change_cd_activate(GtkWidget *menu, VirtViewerWindow *self);
 
 
 /* Internal methods */
@@ -89,13 +94,13 @@ struct _VirtViewerWindowPrivate {
 
     GtkBuilder *builder;
     GtkWidget *window;
-    GtkWidget *layout;
     GtkWidget *toolbar;
     GtkWidget *toolbar_usb_device_selection;
     GtkWidget *toolbar_send_key;
     GtkAccelGroup *accel_group;
     VirtViewerNotebook *notebook;
     VirtViewerDisplay *display;
+    VirtViewerTimedRevealer *revealer;
 
     gboolean accel_enabled;
     GValue accel_setting;
@@ -186,6 +191,8 @@ virt_viewer_window_dispose (GObject *object)
         priv->builder = NULL;
     }
 
+    priv->revealer = NULL;
+
     for (it = priv->accel_list ; it != NULL ; it = it->next) {
         g_object_unref(G_OBJECT(it->data));
     }
@@ -196,7 +203,7 @@ virt_viewer_window_dispose (GObject *object)
     priv->subtitle = NULL;
 
     g_value_unset(&priv->accel_setting);
-    g_clear_object(&priv->toolbar);
+    priv->toolbar = NULL;
 
     G_OBJECT_CLASS (virt_viewer_window_parent_class)->dispose (object);
 }
@@ -293,7 +300,6 @@ virt_viewer_window_init (VirtViewerWindow *self)
 {
     VirtViewerWindowPrivate *priv;
     GtkWidget *vbox;
-    GdkRGBA color;
     GSList *accels;
 
     self->priv = GET_PRIVATE(self);
@@ -303,7 +309,9 @@ virt_viewer_window_init (VirtViewerWindow *self)
     g_value_init(&priv->accel_setting, G_TYPE_STRING);
 
     priv->notebook = virt_viewer_notebook_new();
-    priv->builder = virt_viewer_util_load_ui("virt-viewer.xml");
+    gtk_widget_show(GTK_WIDGET(priv->notebook));
+
+    priv->builder = virt_viewer_util_load_ui("virt-viewer.ui");
 
     gtk_widget_set_sensitive(GTK_WIDGET(gtk_builder_get_object(self->priv->builder, "menu-send")), FALSE);
     gtk_widget_set_sensitive(GTK_WIDGET(gtk_builder_get_object(self->priv->builder, "menu-view-zoom")), FALSE);
@@ -333,16 +341,7 @@ virt_viewer_window_init (VirtViewerWindow *self)
     vbox = GTK_WIDGET(gtk_builder_get_object(priv->builder, "viewer-box"));
     virt_viewer_window_toolbar_setup(self);
 
-    gtk_box_pack_end(GTK_BOX(vbox), priv->layout, TRUE, TRUE, 0);
-    gdk_rgba_parse(&color, "black");
-    /* FIXME:
-     * This method has been deprecated in 3.16.
-     * For more details on how to deal with this in the future, please, see:
-     * https://developer.gnome.org/gtk3/stable/GtkWidget.html#gtk-widget-override-background-color
-     * For the bug report about this deprecated function, please, see:
-     * https://bugs.freedesktop.org/show_bug.cgi?id=94276
-     */
-    gtk_widget_override_background_color(priv->layout, GTK_STATE_FLAG_NORMAL, &color);
+    gtk_box_pack_end(GTK_BOX(vbox), GTK_WIDGET(priv->notebook), TRUE, TRUE, 0);
 
     priv->window = GTK_WIDGET(gtk_builder_get_object(priv->builder, "viewer"));
     gtk_window_add_accel_group(GTK_WINDOW(priv->window), priv->accel_group);
@@ -377,6 +376,8 @@ virt_viewer_window_get_real_zoom_level(VirtViewerWindow *self)
 {
     GtkAllocation allocation;
     guint width, height;
+
+    g_return_val_if_fail(self->priv->display != NULL, NORMAL_ZOOM_LEVEL);
 
     gtk_widget_get_allocation(GTK_WIDGET(self->priv->display), &allocation);
     virt_viewer_display_get_desktop_size(self->priv->display, &width, &height);
@@ -413,10 +414,14 @@ virt_viewer_window_queue_resize(VirtViewerWindow *self)
 {
     VirtViewerWindowPrivate *priv = self->priv;
     GtkRequisition nat;
+    GtkWidget *child;
+    guint border;
 
+    border = gtk_container_get_border_width(GTK_CONTAINER(priv->window));
+    child = gtk_bin_get_child(GTK_BIN(priv->window));
     gtk_window_set_default_size(GTK_WINDOW(priv->window), -1, -1);
-    gtk_widget_get_preferred_size(GTK_WIDGET(priv->window), NULL, &nat);
-    gtk_window_resize(GTK_WINDOW(priv->window), nat.width, nat.height);
+    gtk_widget_get_preferred_size(child, NULL, &nat);
+    gtk_window_resize(GTK_WINDOW(priv->window), nat.width + border, nat.height + border);
 }
 
 static void
@@ -432,7 +437,7 @@ virt_viewer_window_move_to_monitor(VirtViewerWindow *self)
     gdk_screen_get_monitor_geometry(gdk_screen_get_default(), n, &mon);
     gtk_window_move(GTK_WINDOW(priv->window), mon.x, mon.y);
 
-    gtk_widget_set_size_request(GTK_WIDGET(priv->window),
+    gtk_widget_set_size_request(priv->window,
                                 mon.width,
                                 mon.height);
 }
@@ -477,10 +482,10 @@ virt_viewer_window_leave_fullscreen(VirtViewerWindow *self)
         virt_viewer_display_set_monitor(priv->display, -1);
         virt_viewer_display_set_fullscreen(priv->display, FALSE);
     }
-    ViewAutoDrawer_SetActive(VIEW_AUTODRAWER(priv->layout), FALSE);
+    virt_viewer_timed_revealer_force_reveal(priv->revealer, FALSE);
     gtk_widget_show(menu);
     gtk_widget_hide(priv->toolbar);
-    gtk_widget_set_size_request(GTK_WIDGET(priv->window), -1, -1);
+    gtk_widget_set_size_request(priv->window, -1, -1);
     gtk_window_unfullscreen(GTK_WINDOW(priv->window));
 
 }
@@ -513,9 +518,11 @@ virt_viewer_window_enter_fullscreen(VirtViewerWindow *self, gint monitor)
 
     virt_viewer_window_menu_fullscreen_set_active(self, TRUE);
     gtk_widget_hide(menu);
-    gtk_widget_show(priv->toolbar);
-    ViewAutoDrawer_SetActive(VIEW_AUTODRAWER(priv->layout), TRUE);
-    ViewAutoDrawer_Close(VIEW_AUTODRAWER(priv->layout));
+
+    if (!priv->kiosk) {
+        gtk_widget_show(priv->toolbar);
+        virt_viewer_timed_revealer_force_reveal(priv->revealer, TRUE);
+    }
 
     if (priv->display) {
         virt_viewer_display_set_monitor(priv->display, monitor);
@@ -604,36 +611,33 @@ virt_viewer_menu_add_combo(VirtViewerWindow *self, GtkMenu *menu,
 static guint*
 accel_key_to_keys(const GtkAccelKey *key)
 {
-    guint val;
-    GArray *a = g_array_new(FALSE, FALSE, sizeof(guint));
+    guint i;
+    guint *val, *keys;
+    const struct {
+        const guint mask;
+        const guint key;
+    } modifiers[] = {
+        {GDK_SHIFT_MASK, GDK_KEY_Shift_L},
+        {GDK_CONTROL_MASK, GDK_KEY_Control_L},
+        {GDK_MOD1_MASK, GDK_KEY_Alt_L},
+    };
 
     g_warn_if_fail((key->accel_mods &
                     ~(GDK_SHIFT_MASK | GDK_CONTROL_MASK | GDK_MOD1_MASK)) == 0);
 
+    keys = val = g_new(guint, 5); /* up to 3 modifiers, key and the stop symbol */
     /* first, send the modifiers */
-    if (key->accel_mods & GDK_SHIFT_MASK) {
-        val = GDK_KEY_Shift_L;
-        g_array_append_val(a, val);
-    }
-
-    if (key->accel_mods & GDK_CONTROL_MASK) {
-        val = GDK_KEY_Control_L;
-        g_array_append_val(a, val);
-    }
-
-    if (key->accel_mods & GDK_MOD1_MASK) {
-        val = GDK_KEY_Alt_L;
-        g_array_append_val(a, val);
+    for (i = 0; i < G_N_ELEMENTS(modifiers); i++) {
+        if (key->accel_mods & modifiers[i].mask)
+            *val++ = modifiers[i].key;
     }
 
     /* only after, the non-modifier key (ctrl-t, not t-ctrl) */
-    val = key->accel_key;
-    g_array_append_val(a, val);
+    *val++ = key->accel_key;
+    /* stop symbol */
+    *val = GDK_KEY_VoidSymbol;
 
-    val = GDK_KEY_VoidSymbol;
-    g_array_append_val(a, val);
-
-    return (guint*)g_array_free(a, FALSE);
+    return keys;
 }
 
 struct accelCbData
@@ -692,6 +696,45 @@ virt_viewer_window_get_keycombo_menu(VirtViewerWindow *self)
     return menu;
 }
 
+static void
+action_zoom_in(G_GNUC_UNUSED GSimpleAction *action,
+               G_GNUC_UNUSED GVariant *state,
+               gpointer user_data)
+{
+    virt_viewer_window_menu_view_zoom_in(NULL, VIRT_VIEWER_WINDOW(user_data));
+}
+
+static void
+action_zoom_out(G_GNUC_UNUSED GSimpleAction *action,
+                G_GNUC_UNUSED GVariant *state,
+                gpointer user_data)
+{
+    virt_viewer_window_menu_view_zoom_out(NULL, VIRT_VIEWER_WINDOW(user_data));
+}
+
+static void
+action_zoom_reset(G_GNUC_UNUSED GSimpleAction *action,
+                  G_GNUC_UNUSED GVariant *state,
+                  gpointer user_data)
+{
+    virt_viewer_window_menu_view_zoom_reset(NULL, VIRT_VIEWER_WINDOW(user_data));
+}
+
+/* Keep keypad_action_entries and keypad_action_accels in sync */
+static const GActionEntry keypad_action_entries[] = {
+    { .name = "zoom-in", .activate = action_zoom_in },
+    { .name = "zoom-out", .activate = action_zoom_out },
+    { .name = "zoom-reset", .activate = action_zoom_reset },
+};
+
+static const gchar *const keypad_action_accels[][2] = {
+    /* numpad keys are not handled automatically by gtk, see bgo#699823 */
+    {"<control>KP_Add", NULL},
+    {"<control>KP_Subtract", NULL},
+    {"<control>KP_0", NULL},
+};
+G_STATIC_ASSERT(G_N_ELEMENTS(keypad_action_entries) == G_N_ELEMENTS(keypad_action_accels));
+
 void
 virt_viewer_window_disable_modifiers(VirtViewerWindow *self)
 {
@@ -699,6 +742,7 @@ virt_viewer_window_disable_modifiers(VirtViewerWindow *self)
     VirtViewerWindowPrivate *priv = self->priv;
     GValue empty;
     GSList *accels;
+    guint i;
 
     if (!priv->accel_enabled)
         return;
@@ -725,6 +769,10 @@ virt_viewer_window_disable_modifiers(VirtViewerWindow *self)
                  "gtk-enable-mnemonics", FALSE,
                  NULL);
 
+    for (i = 0; i < G_N_ELEMENTS(keypad_action_entries); i++) {
+        g_action_map_remove_action(G_ACTION_MAP(priv->window), keypad_action_entries[i].name);
+    }
+
     priv->accel_enabled = FALSE;
 }
 
@@ -734,6 +782,7 @@ virt_viewer_window_enable_modifiers(VirtViewerWindow *self)
     GtkSettings *settings = gtk_settings_get_default();
     VirtViewerWindowPrivate *priv = self->priv;
     GSList *accels;
+    guint i;
 
     if (priv->accel_enabled)
         return;
@@ -753,6 +802,17 @@ virt_viewer_window_enable_modifiers(VirtViewerWindow *self)
     g_object_set(settings,
                  "gtk-enable-mnemonics", priv->enable_mnemonics_save,
                  NULL);
+
+    g_action_map_add_action_entries(G_ACTION_MAP(priv->window),
+                                    keypad_action_entries, G_N_ELEMENTS(keypad_action_entries),
+                                    self);
+    for (i = 0; i < G_N_ELEMENTS(keypad_action_entries); i++) {
+        gchar *detailed_name = g_strdup_printf("win.%s", keypad_action_entries[i].name);
+        gtk_application_set_accels_for_action(GTK_APPLICATION(priv->app),
+                                              detailed_name,
+                                              keypad_action_accels[i]);
+        g_free(detailed_name);
+    }
 
     priv->accel_enabled = TRUE;
 }
@@ -820,7 +880,7 @@ virt_viewer_window_toolbar_send_key(GtkWidget *button G_GNUC_UNUSED,
                                     VirtViewerWindow *self)
 {
     GtkMenu *menu = virt_viewer_window_get_keycombo_menu(self);
-    gtk_menu_attach_to_widget(menu, GTK_WIDGET(self->priv->window), NULL);
+    gtk_menu_attach_to_widget(menu, self->priv->window, NULL);
     g_object_ref_sink(menu);
     gtk_menu_popup(menu, NULL, NULL, keycombo_menu_location, self,
                    0, gtk_get_current_event_time());
@@ -878,34 +938,29 @@ static GdkPixbufFormat *get_image_format(const char *filename)
     return g_hash_table_lookup(image_formats_once.retval, ext);
 }
 
-static void
+static gboolean
 virt_viewer_window_save_screenshot(VirtViewerWindow *self,
-                                   const char *file)
+                                   const char *file,
+                                   GError **error)
 {
     VirtViewerWindowPrivate *priv = self->priv;
     GdkPixbuf *pix = virt_viewer_display_get_pixbuf(VIRT_VIEWER_DISPLAY(priv->display));
     GdkPixbufFormat *format = get_image_format(file);
+    gboolean result;
 
     if (format == NULL) {
-        g_debug("unknown file extension, falling back to png");
-        if (!g_str_has_suffix(file, ".png")) {
-            char *png_filename;
-            png_filename = g_strconcat(file, ".png", NULL);
-            gdk_pixbuf_save(pix, png_filename, "png", NULL,
-                            "tEXt::Generator App", PACKAGE, NULL);
-            g_free(png_filename);
-        } else {
-            gdk_pixbuf_save(pix, file, "png", NULL,
-                            "tEXt::Generator App", PACKAGE, NULL);
-        }
+        g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+                    _("Unable to determine image format for file '%s'"), file);
+        result = FALSE;
     } else {
         char *type = gdk_pixbuf_format_get_name(format);
         g_debug("saving to %s", type);
-        gdk_pixbuf_save(pix, file, type, NULL, NULL);
+        result = gdk_pixbuf_save(pix, file, type, error, NULL);
         g_free(type);
     }
 
     g_object_unref(pix);
+    return result;
 }
 
 G_MODULE_EXPORT void
@@ -930,13 +985,18 @@ virt_viewer_window_menu_file_screenshot(GtkWidget *menu G_GNUC_UNUSED,
     image_dir = g_get_user_special_dir(G_USER_DIRECTORY_PICTURES);
     if (image_dir != NULL)
         gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER (dialog), image_dir);
-    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER (dialog), _("Screenshot"));
+    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER (dialog), _("Screenshot.png"));
 
     if (gtk_dialog_run(GTK_DIALOG (dialog)) == GTK_RESPONSE_ACCEPT) {
         char *filename;
+        GError *error = NULL;
 
         filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER (dialog));
-        virt_viewer_window_save_screenshot(self, filename);
+        if (!virt_viewer_window_save_screenshot(self, filename, &error)) {
+            virt_viewer_app_simple_message_dialog(self->priv->app,
+                                                  error->message);
+            g_error_free(error);
+        }
         g_free(filename);
     }
 
@@ -969,7 +1029,7 @@ G_MODULE_EXPORT void
 virt_viewer_window_menu_preferences_cb(GtkWidget *menu G_GNUC_UNUSED,
                                        VirtViewerWindow *self)
 {
-    virt_viewer_app_show_preferences(self->priv->app, GTK_WIDGET(self->priv->window));
+    virt_viewer_app_show_preferences(self->priv->app, self->priv->window);
 }
 
 G_MODULE_EXPORT void
@@ -984,7 +1044,7 @@ G_MODULE_EXPORT void
 virt_viewer_window_menu_help_guest_details(GtkWidget *menu G_GNUC_UNUSED,
                                            VirtViewerWindow *self)
 {
-    GtkBuilder *ui = virt_viewer_util_load_ui("virt-viewer-guest-details.xml");
+    GtkBuilder *ui = virt_viewer_util_load_ui("virt-viewer-guest-details.ui");
     char *name = NULL;
     char *uuid = NULL;
 
@@ -1034,7 +1094,7 @@ virt_viewer_window_menu_help_about(GtkWidget *menu G_GNUC_UNUSED,
     GtkWidget *dialog;
     GdkPixbuf *icon;
 
-    about = virt_viewer_util_load_ui("virt-viewer-about.xml");
+    about = virt_viewer_util_load_ui("virt-viewer-about.ui");
 
     dialog = GTK_WIDGET(gtk_builder_get_object(about, "about"));
 
@@ -1058,14 +1118,53 @@ virt_viewer_window_menu_help_about(GtkWidget *menu G_GNUC_UNUSED,
     g_object_unref(G_OBJECT(about));
 }
 
+#if HAVE_OVIRT
+static void
+iso_dialog_response(GtkDialog *dialog,
+                    gint response_id,
+                    gpointer user_data G_GNUC_UNUSED)
+{
+    if (response_id == GTK_RESPONSE_NONE)
+        return;
+
+    gtk_widget_destroy(GTK_WIDGET(dialog));
+}
+#endif
+
+void
+virt_viewer_window_menu_change_cd_activate(GtkWidget *menu G_GNUC_UNUSED,
+                                           VirtViewerWindow *self G_GNUC_UNUSED)
+{
+#if HAVE_OVIRT
+    VirtViewerWindowPrivate *priv = self->priv;
+    GtkWidget *dialog;
+    GObject *foreign_menu;
+
+    g_object_get(G_OBJECT(priv->app), "ovirt-foreign-menu", &foreign_menu, NULL);
+    dialog = remote_viewer_iso_list_dialog_new(GTK_WINDOW(priv->window), foreign_menu);
+    g_object_unref(foreign_menu);
+
+    if (!dialog)
+        dialog = gtk_message_dialog_new(GTK_WINDOW(priv->window),
+                                        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                                        GTK_MESSAGE_ERROR,
+                                        GTK_BUTTONS_CLOSE,
+                                        _("Unable to connnect to oVirt"));
+
+    g_signal_connect(dialog, "response", G_CALLBACK(iso_dialog_response), NULL);
+    gtk_widget_show_all(dialog);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+#endif
+}
 
 static void
 virt_viewer_window_toolbar_setup(VirtViewerWindow *self)
 {
     GtkWidget *button;
+    GtkWidget *overlay;
     VirtViewerWindowPrivate *priv = self->priv;
 
-    priv->toolbar = g_object_ref(gtk_toolbar_new());
+    priv->toolbar = gtk_toolbar_new();
     gtk_toolbar_set_show_arrow(GTK_TOOLBAR(priv->toolbar), FALSE);
     gtk_widget_set_no_show_all(priv->toolbar, TRUE);
     gtk_toolbar_set_style(GTK_TOOLBAR(priv->toolbar), GTK_TOOLBAR_BOTH_HORIZ);
@@ -1074,7 +1173,7 @@ virt_viewer_window_toolbar_setup(VirtViewerWindow *self)
     button = GTK_WIDGET(gtk_tool_button_new(NULL, NULL));
     gtk_tool_button_set_icon_name(GTK_TOOL_BUTTON(button), "window-close");
     gtk_tool_item_set_tooltip_text(GTK_TOOL_ITEM(button), _("Disconnect"));
-    gtk_widget_show(GTK_WIDGET(button));
+    gtk_widget_show(button);
     gtk_toolbar_insert(GTK_TOOLBAR(priv->toolbar), GTK_TOOL_ITEM (button), 0);
     g_signal_connect(button, "clicked", G_CALLBACK(virt_viewer_window_menu_file_quit), self);
 
@@ -1092,7 +1191,7 @@ virt_viewer_window_toolbar_setup(VirtViewerWindow *self)
     button = GTK_WIDGET(gtk_tool_button_new(NULL, NULL));
     gtk_tool_button_set_icon_name(GTK_TOOL_BUTTON(button), "preferences-desktop-keyboard-shortcuts");
     gtk_tool_item_set_tooltip_text(GTK_TOOL_ITEM(button), _("Send key combination"));
-    gtk_widget_show(GTK_WIDGET(button));
+    gtk_widget_show(button);
     gtk_toolbar_insert(GTK_TOOLBAR(priv->toolbar), GTK_TOOL_ITEM(button), 0);
     g_signal_connect(button, "clicked", G_CALLBACK(virt_viewer_window_toolbar_send_key), self);
     gtk_widget_set_sensitive(button, FALSE);
@@ -1104,20 +1203,13 @@ virt_viewer_window_toolbar_setup(VirtViewerWindow *self)
     gtk_tool_button_set_label(GTK_TOOL_BUTTON(button), _("Leave fullscreen"));
     gtk_tool_item_set_tooltip_text(GTK_TOOL_ITEM(button), _("Leave fullscreen"));
     gtk_tool_item_set_is_important(GTK_TOOL_ITEM(button), TRUE);
-    gtk_widget_show(GTK_WIDGET(button));
+    gtk_widget_show(button);
     gtk_toolbar_insert(GTK_TOOLBAR(priv->toolbar), GTK_TOOL_ITEM(button), 0);
     g_signal_connect(button, "clicked", G_CALLBACK(virt_viewer_window_toolbar_leave_fullscreen), self);
 
-    priv->layout = ViewAutoDrawer_New();
-
-    ViewAutoDrawer_SetActive(VIEW_AUTODRAWER(priv->layout), FALSE);
-    ViewOvBox_SetOver(VIEW_OV_BOX(priv->layout), priv->toolbar);
-    ViewOvBox_SetUnder(VIEW_OV_BOX(priv->layout), GTK_WIDGET(priv->notebook));
-    ViewAutoDrawer_SetOffset(VIEW_AUTODRAWER(priv->layout), -1);
-    ViewAutoDrawer_SetFill(VIEW_AUTODRAWER(priv->layout), FALSE);
-    ViewAutoDrawer_SetOverlapPixels(VIEW_AUTODRAWER(priv->layout), 1);
-    ViewAutoDrawer_SetNoOverlapPixels(VIEW_AUTODRAWER(priv->layout), 0);
-    gtk_widget_show(priv->layout);
+    priv->revealer = virt_viewer_timed_revealer_new(priv->toolbar);
+    overlay = GTK_WIDGET(gtk_builder_get_object(priv->builder, "viewer-overlay"));
+    gtk_overlay_add_overlay(GTK_OVERLAY(overlay), GTK_WIDGET(priv->revealer));
 }
 
 VirtViewerNotebook*
@@ -1175,7 +1267,7 @@ virt_viewer_window_update_title(VirtViewerWindow *self)
 
     if (priv->grabbed) {
         gchar *label;
-        GtkAccelKey key = { 0 };
+        GtkAccelKey key = {0, 0, 0};
 
         if (virt_viewer_app_get_enable_accel(priv->app))
             gtk_accel_map_lookup_entry("<virt-viewer>/view/release-cursor", &key);
@@ -1355,9 +1447,7 @@ virt_viewer_window_enable_kiosk(VirtViewerWindow *self)
     g_return_if_fail(VIRT_VIEWER_IS_WINDOW(self));
     priv = self->priv;
 
-    ViewOvBox_SetOver(VIEW_OV_BOX(priv->layout), gtk_drawing_area_new());
-    ViewAutoDrawer_SetActive(VIEW_AUTODRAWER(priv->layout), FALSE);
-    ViewAutoDrawer_SetOverlapPixels(VIEW_AUTODRAWER(priv->layout), 0);
+    virt_viewer_timed_revealer_force_reveal(priv->revealer, FALSE);
 
     /* You probably also want X11 Option "DontVTSwitch" "true" */
     /* and perhaps more distro/desktop-specific options */

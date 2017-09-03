@@ -35,6 +35,7 @@
 #include <gio/gio.h>
 #include <glib/gprintf.h>
 #include <glib/gi18n.h>
+#include <errno.h>
 
 #ifdef HAVE_SYS_SOCKET_H
 #include <sys/socket.h>
@@ -644,13 +645,14 @@ virt_viewer_app_open_tunnel_ssh(const char *sshhost,
 }
 
 static int
-virt_viewer_app_open_unix_sock(const char *unixsock)
+virt_viewer_app_open_unix_sock(const char *unixsock, GError **error)
 {
     struct sockaddr_un addr;
     int fd;
 
     if (strlen(unixsock) + 1 > sizeof(addr.sun_path)) {
-        g_warning ("address is too long for unix socket_path: %s", unixsock);
+        g_set_error(error, VIRT_VIEWER_ERROR, VIRT_VIEWER_ERROR_FAILED,
+                    _("Address is too long for unix socket_path: %s"), unixsock);
         return -1;
     }
 
@@ -658,10 +660,15 @@ virt_viewer_app_open_unix_sock(const char *unixsock)
     addr.sun_family = AF_UNIX;
     strcpy(addr.sun_path, unixsock);
 
-    if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0)
+    if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
+        g_set_error(error, VIRT_VIEWER_ERROR, VIRT_VIEWER_ERROR_FAILED,
+                    _("Creating unix socket failed: %s"), g_strerror(errno));
         return -1;
+    }
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
+        g_set_error(error, VIRT_VIEWER_ERROR, VIRT_VIEWER_ERROR_FAILED,
+                    _("Connecting to unix socket failed: %s"), g_strerror(errno));
         close(fd);
         return -1;
     }
@@ -898,7 +905,6 @@ ensure_window_for_display(VirtViewerApp *self, VirtViewerDisplay *display)
         if (l && virt_viewer_window_get_display(VIRT_VIEWER_WINDOW(l->data)) == NULL) {
             win = VIRT_VIEWER_WINDOW(l->data);
             g_debug("Found a window without a display, reusing for display #%d", nth);
-            virt_viewer_app_set_window_subtitle(self, win, nth);
             if (self->priv->fullscreen && !self->priv->kiosk)
                 app_window_try_fullscreen(self, win, nth);
         } else {
@@ -907,6 +913,7 @@ ensure_window_for_display(VirtViewerApp *self, VirtViewerDisplay *display)
 
         virt_viewer_window_set_display(win, display);
     }
+    virt_viewer_app_set_window_subtitle(self, win, nth);
 
     return win;
 }
@@ -1122,6 +1129,7 @@ virt_viewer_app_channel_open(VirtViewerSession *session,
 {
     VirtViewerAppPrivate *priv;
     int fd = -1;
+    gchar *error_message = NULL;
 
     g_return_if_fail(self != NULL);
 
@@ -1134,14 +1142,30 @@ virt_viewer_app_channel_open(VirtViewerSession *session,
     if (priv->transport && g_ascii_strcasecmp(priv->transport, "ssh") == 0 &&
         !priv->direct && fd == -1) {
         if ((fd = virt_viewer_app_open_tunnel_ssh(priv->host, priv->port, priv->user,
-                                                  priv->ghost, priv->gport, NULL)) < 0)
-            virt_viewer_app_simple_message_dialog(self, _("Connect to ssh failed."));
-    } else if (fd == -1) {
-        virt_viewer_app_simple_message_dialog(self, _("Can't connect to channel, SSH only supported."));
+                                                  priv->ghost, priv->gport, priv->unixsock)) < 0) {
+            error_message = g_strdup(_("Connect to ssh failed."));
+            g_debug("channel open ssh tunnel: %s", error_message);
+        }
+    }
+    if (fd < 0 && priv->unixsock) {
+        GError *error = NULL;
+        if ((fd = virt_viewer_app_open_unix_sock(priv->unixsock, &error)) < 0) {
+            g_free(error_message);
+            error_message = g_strdup(error->message);
+            g_debug("channel open unix socket: %s", error_message);
+        }
+        g_clear_error(&error);
     }
 
-    if (fd >= 0)
-        virt_viewer_session_channel_open_fd(session, channel, fd);
+    if (fd < 0) {
+        virt_viewer_app_simple_message_dialog(self, _("Can't connect to channel: %s"),
+                                              (error_message != NULL) ? error_message :
+                                              _("only SSH or unix socket connection supported."));
+        g_free(error_message);
+        return;
+    }
+
+    virt_viewer_session_channel_open_fd(session, channel, fd);
 }
 #else
 static void
@@ -1194,7 +1218,7 @@ virt_viewer_app_default_activate(VirtViewerApp *self, GError **error)
     } else if (priv->unixsock && fd == -1) {
         virt_viewer_app_trace(self, "Opening direct UNIX connection to display at %s",
                               priv->unixsock);
-        if ((fd = virt_viewer_app_open_unix_sock(priv->unixsock)) < 0)
+        if ((fd = virt_viewer_app_open_unix_sock(priv->unixsock, error)) < 0)
             return FALSE;
     }
 #endif
@@ -1232,6 +1256,8 @@ virt_viewer_app_activate(VirtViewerApp *self, GError **error)
     ret = VIRT_VIEWER_APP_GET_CLASS(self)->activate(self, error);
 
     if (ret == FALSE) {
+        if(error != NULL && *error != NULL)
+            virt_viewer_app_show_status(self, (*error)->message);
         priv->connected = FALSE;
     } else {
         virt_viewer_app_show_status(self, _("Connecting to graphic server"));
@@ -1415,6 +1441,8 @@ virt_viewer_app_disconnected(VirtViewerSession *session G_GNUC_UNUSED, const gch
 
     if (!priv->kiosk)
         virt_viewer_app_hide_all_windows(self);
+    else if (priv->cancelled)
+        priv->authretry = TRUE;
 
     if (priv->quitting)
         g_application_quit(G_APPLICATION(self));
@@ -1452,7 +1480,8 @@ static void virt_viewer_app_auth_refused(VirtViewerSession *session,
 
     /* if the session implementation cannot retry auth automatically, the
      * VirtViewerApp needs to schedule a new connection to retry */
-    priv->authretry = !virt_viewer_session_can_retry_auth(session);
+    priv->authretry = (!virt_viewer_session_can_retry_auth(session) &&
+                       !virt_viewer_session_get_file(session));
 }
 
 static void virt_viewer_app_auth_unsupported(VirtViewerSession *session G_GNUC_UNUSED,
@@ -1720,7 +1749,6 @@ virt_viewer_app_init(VirtViewerApp *self)
 
     g_clear_error(&error);
 
-    self->priv->initial_display_map = virt_viewer_app_get_monitor_mapping_for_section(self, "fallback");
     g_signal_connect(self, "notify::guest-name", G_CALLBACK(title_maybe_changed), NULL);
     g_signal_connect(self, "notify::title", G_CALLBACK(title_maybe_changed), NULL);
     g_signal_connect(self, "notify::guri", G_CALLBACK(title_maybe_changed), NULL);
@@ -1762,7 +1790,7 @@ virt_viewer_update_smartcard_accels(VirtViewerApp *self)
         sw_smartcard = FALSE;
     }
     if (sw_smartcard) {
-        g_warning("enabling smartcard shortcuts");
+        g_debug("enabling smartcard shortcuts");
         gtk_accel_map_change_entry("<virt-viewer>/file/smartcard-insert",
                                    priv->insert_smartcard_accel_key,
                                    priv->insert_smartcard_accel_mods,
@@ -1772,7 +1800,7 @@ virt_viewer_update_smartcard_accels(VirtViewerApp *self)
                                    priv->remove_smartcard_accel_mods,
                                    TRUE);
     } else {
-        g_warning("disabling smartcard shortcuts");
+        g_debug("disabling smartcard shortcuts");
         gtk_accel_map_change_entry("<virt-viewer>/file/smartcard-insert", 0, 0, TRUE);
         gtk_accel_map_change_entry("<virt-viewer>/file/smartcard-remove", 0, 0, TRUE);
     }
@@ -1797,6 +1825,7 @@ virt_viewer_app_on_application_startup(GApplication *app)
     self->priv->main_window = virt_viewer_app_window_new(self,
                                                          virt_viewer_app_get_first_monitor(self));
     self->priv->main_notebook = GTK_WIDGET(virt_viewer_window_get_notebook(self->priv->main_window));
+    self->priv->initial_display_map = virt_viewer_app_get_monitor_mapping_for_section(self, "fallback");
 
     virt_viewer_app_set_kiosk(self, opt_kiosk);
     virt_viewer_app_set_hotkeys(self, opt_hotkeys);
@@ -1825,8 +1854,6 @@ virt_viewer_app_on_application_startup(GApplication *app)
         g_application_quit(app);
         return;
     }
-
-    g_application_hold(app);
 }
 
 static gboolean
@@ -2065,17 +2092,22 @@ virt_viewer_app_set_hotkeys(VirtViewerApp *self, const gchar *hotkeys_str)
 
     for (hotkey = hotkeys; *hotkey != NULL; hotkey++) {
         gchar *key = strstr(*hotkey, "=");
-        if (key == NULL) {
-            g_warn_if_reached();
+        const gchar *value = (key == NULL) ? NULL : (*key = '\0', key + 1);
+        if (value == NULL || *value == '\0') {
+            g_warning("missing value for key '%s'", *hotkey);
             continue;
         }
-        *key = '\0';
 
-        gchar *accel = spice_hotkey_to_gtk_accelerator(key + 1);
+        gchar *accel = spice_hotkey_to_gtk_accelerator(value);
         guint accel_key;
         GdkModifierType accel_mods;
         gtk_accelerator_parse(accel, &accel_key, &accel_mods);
         g_free(accel);
+
+        if (accel_key == 0 && accel_mods == 0) {
+            g_warning("Invalid value '%s' for key '%s'", value, *hotkey);
+            continue;
+        }
 
         if (g_str_equal(*hotkey, "toggle-fullscreen")) {
             gtk_accel_map_change_entry("<virt-viewer>/view/toggle-fullscreen", accel_key, accel_mods, TRUE);
@@ -2286,8 +2318,8 @@ window_update_menu_displays_cb(gpointer value,
         gboolean visible;
         gchar *label;
 
-        label = g_strdup_printf(_("Display %d"), nth + 1);
-        item = gtk_check_menu_item_new_with_label(label);
+        label = g_strdup_printf(_("Display _%d"), nth + 1);
+        item = gtk_check_menu_item_new_with_mnemonic(label);
         g_free(label);
 
         visible = vwin && gtk_widget_get_visible(GTK_WIDGET(virt_viewer_window_get_window(vwin)));
@@ -2462,7 +2494,7 @@ static GtkWidget *
 virt_viewer_app_get_preferences(VirtViewerApp *self)
 {
     VirtViewerSession *session = virt_viewer_app_get_session(self);
-    GtkBuilder *builder = virt_viewer_util_load_ui("virt-viewer-preferences.xml");
+    GtkBuilder *builder = virt_viewer_util_load_ui("virt-viewer-preferences.ui");
     gboolean can_share_folder = virt_viewer_session_can_share_folder(session);
     GtkWidget *preferences = self->priv->preferences;
     gchar *path;

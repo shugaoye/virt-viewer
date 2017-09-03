@@ -30,11 +30,11 @@
 
 #include <usb-device-widget.h>
 #include "virt-viewer-file.h"
+#include "virt-viewer-file-transfer-dialog.h"
 #include "virt-viewer-util.h"
 #include "virt-viewer-session-spice.h"
 #include "virt-viewer-display-spice.h"
 #include "virt-viewer-auth.h"
-
 
 G_DEFINE_TYPE (VirtViewerSessionSpice, virt_viewer_session_spice, VIRT_VIEWER_TYPE_SESSION)
 
@@ -50,6 +50,8 @@ struct _VirtViewerSessionSpicePrivate {
     gboolean has_sw_smartcard_reader;
     guint pass_try;
     gboolean did_auto_conf;
+    VirtViewerFileTransferDialog *file_transfer_dialog;
+
 };
 
 #define VIRT_VIEWER_SESSION_SPICE_GET_PRIVATE(o) (G_TYPE_INSTANCE_GET_PRIVATE((o), VIRT_VIEWER_TYPE_SESSION_SPICE, VirtViewerSessionSpicePrivate))
@@ -147,6 +149,10 @@ virt_viewer_session_spice_dispose(GObject *obj)
     spice->priv->audio = NULL;
 
     g_clear_object(&spice->priv->main_window);
+    if (spice->priv->file_transfer_dialog) {
+        gtk_widget_destroy(GTK_WIDGET(spice->priv->file_transfer_dialog));
+        spice->priv->file_transfer_dialog = NULL;
+    }
 
     G_OBJECT_CLASS(virt_viewer_session_spice_parent_class)->dispose(obj);
 }
@@ -223,6 +229,9 @@ virt_viewer_session_spice_constructed(GObject *obj)
     virt_viewer_signal_connect_object(self, "notify::share-folder",
                                       G_CALLBACK(update_share_folder), self,
                                       G_CONNECT_SWAPPED);
+
+    self->priv->file_transfer_dialog =
+        virt_viewer_file_transfer_dialog_new(self->priv->main_window);
 
     G_OBJECT_CLASS(virt_viewer_session_spice_parent_class)->constructed(obj);
 }
@@ -682,14 +691,13 @@ virt_viewer_session_spice_main_channel_event(SpiceChannel *channel,
     case SPICE_CHANNEL_ERROR_AUTH:
     {
         const GError *error = NULL;
+        gchar *host = NULL;
         g_debug("main channel: auth failure (wrong username/password?)");
 
-        {
-            error = spice_channel_get_error(channel);
-            username_required = g_error_matches(error,
-                                                SPICE_CLIENT_ERROR,
-                                                SPICE_CLIENT_ERROR_AUTH_NEEDS_PASSWORD_AND_USERNAME);
-        }
+        error = spice_channel_get_error(channel);
+        username_required = g_error_matches(error,
+                                            SPICE_CLIENT_ERROR,
+                                            SPICE_CLIENT_ERROR_AUTH_NEEDS_PASSWORD_AND_USERNAME);
 
         if (self->priv->pass_try > 0)
             g_signal_emit_by_name(session, "session-auth-refused",
@@ -708,12 +716,18 @@ virt_viewer_session_spice_main_channel_event(SpiceChannel *channel,
                 user = g_strdup(g_get_user_name());
         }
 
+        g_object_get(self->priv->session, "host", &host, NULL);
         ret = virt_viewer_auth_collect_credentials(self->priv->main_window,
                                                    "SPICE",
-                                                   NULL,
+                                                   host,
                                                    username_required ? &user : NULL,
                                                    &password);
+        g_free(host);
         if (!ret) {
+            /* ret is false when dialog did not return GTK_RESPONSE_OK. We
+             * should ignore auth error dialog if user has cancelled or closed
+             * the dialog */
+            self->priv->pass_try = 0;
             g_signal_emit_by_name(session, "session-cancelled");
         } else {
             gboolean openfd;
@@ -741,7 +755,7 @@ virt_viewer_session_spice_main_channel_event(SpiceChannel *channel,
             g_warn_if_fail(proxy != NULL);
 
             ret = virt_viewer_auth_collect_credentials(self->priv->main_window,
-                                                       "proxy", NULL,
+                                                       "proxy", spice_uri_get_hostname(proxy),
                                                        &user, &password);
             if (!ret) {
                 g_signal_emit_by_name(session, "session-cancelled");
@@ -833,8 +847,11 @@ static void
 destroy_display(gpointer data)
 {
     VirtViewerDisplay *display = VIRT_VIEWER_DISPLAY(data);
-    VirtViewerSession *session = virt_viewer_display_get_session(display);
+    VirtViewerSession *session;
 
+    g_return_if_fail (display != NULL);
+
+    session = virt_viewer_display_get_session(display);
     g_debug("Destroying spice display %p", display);
     virt_viewer_session_remove_display(session, display);
     g_object_unref(display);
@@ -883,6 +900,9 @@ virt_viewer_session_spice_display_monitors(SpiceChannel *channel,
         display = g_ptr_array_index(displays, i);
         if (display == NULL) {
             display = virt_viewer_display_spice_new(self, channel, i);
+            if (display == NULL)
+                continue;
+
             g_debug("creating spice display (#:%d)",
                     virt_viewer_display_get_nth(VIRT_VIEWER_DISPLAY(display)));
             g_ptr_array_index(displays, i) = g_object_ref_sink(display);
@@ -899,8 +919,8 @@ virt_viewer_session_spice_display_monitors(SpiceChannel *channel,
 
         if (!disabled && fullscreen_mode && self->priv->did_auto_conf &&
             !display_is_in_fullscreen_mode(self, VIRT_VIEWER_DISPLAY(display))) {
-            g_warning("display %d should not be enabled, disabling",
-                      virt_viewer_display_get_nth(VIRT_VIEWER_DISPLAY(display)));
+            g_debug("display %d should not be enabled, disabling",
+                    virt_viewer_display_get_nth(VIRT_VIEWER_DISPLAY(display)) + 1);
             spice_main_set_display_enabled(virt_viewer_session_spice_get_main_channel(self),
                                            virt_viewer_display_get_nth(VIRT_VIEWER_DISPLAY(display)),
                                            FALSE);
@@ -919,6 +939,16 @@ virt_viewer_session_spice_display_monitors(SpiceChannel *channel,
 
     g_clear_pointer(&monitors, g_array_unref);
 
+}
+
+static void
+on_new_file_transfer(SpiceMainChannel *channel G_GNUC_UNUSED,
+                     SpiceFileTransferTask *task,
+                     gpointer user_data)
+{
+    VirtViewerSessionSpice *self = VIRT_VIEWER_SESSION_SPICE(user_data);
+    virt_viewer_file_transfer_dialog_add_task(self->priv->file_transfer_dialog,
+                                              task);
 }
 
 static void
@@ -953,6 +983,8 @@ virt_viewer_session_spice_channel_new(SpiceSession *s,
 
         virt_viewer_signal_connect_object(channel, "notify::agent-connected",
                                           G_CALLBACK(agent_connected_changed), self, 0);
+        virt_viewer_signal_connect_object(channel, "new-file-transfer",
+                                          G_CALLBACK(on_new_file_transfer), self, 0);
     }
 
     if (SPICE_IS_DISPLAY_CHANNEL(channel)) {

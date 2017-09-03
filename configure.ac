@@ -1,11 +1,11 @@
 
-AC_INIT([virt-viewer],[3.0])
+AC_INIT([virt-viewer],[6.0])
 AC_CONFIG_SRCDIR(src/virt-viewer-main.c)
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_AUX_DIR([build-aux])
 AC_CONFIG_HEADERS([config.h])
 dnl Make automake keep quiet about wildcards & other GNUmake-isms
-AM_INIT_AUTOMAKE([subdir-objects -Wno-portability])
+AM_INIT_AUTOMAKE([subdir-objects -Wno-portability foreign])
 AC_CANONICAL_HOST
 
 # Use the silent-rules feature when possible.
@@ -17,14 +17,14 @@ GLIB2_REQUIRED="2.38"
 GLIB2_ENCODED_VERSION="GLIB_VERSION_2_38"
 
 # Keep these two definitions in agreement.
-GTK_REQUIRED="3.10"
-GTK_ENCODED_VERSION="GDK_VERSION_3_10"
+GTK_REQUIRED="3.12"
+GTK_ENCODED_VERSION="GDK_VERSION_3_12"
 
 LIBXML2_REQUIRED="2.6.0"
 LIBVIRT_REQUIRED="0.10.0"
 LIBVIRT_GLIB_REQUIRED="0.1.8"
 GTK_VNC_REQUIRED="0.4.0"
-SPICE_GTK_REQUIRED="0.31"
+SPICE_GTK_REQUIRED="0.33"
 SPICE_PROTOCOL_REQUIRED="0.12.7"
 GOVIRT_REQUIRED="0.3.2"
 
@@ -158,11 +158,13 @@ AC_ARG_WITH([spice-gtk],
 
 AS_IF([test "x$with_spice_gtk" != "xno" && test "x$with_spice_gtk" != "xyes"],
       [PKG_CHECK_EXISTS([spice-client-gtk-3.0 >= $SPICE_GTK_REQUIRED
+                         spice-client-glib-2.0 >= $SPICE_GTK_REQUIRED
                          spice-controller spice-protocol >= $SPICE_PROTOCOL_REQUIRED],
                         [with_spice_gtk=yes], [with_spice_gtk=no])])
 
 AS_IF([test "x$with_spice_gtk" = "xyes"],
-      [PKG_CHECK_MODULES(SPICE_GTK, [spice-client-gtk-3.0 >= $SPICE_GTK_REQUIRED])]
+      [PKG_CHECK_MODULES(SPICE_GTK, [spice-client-gtk-3.0 >= $SPICE_GTK_REQUIRED
+                                     spice-client-glib-2.0 >= $SPICE_GTK_REQUIRED])]
       [PKG_CHECK_MODULES(SPICE_CONTROLLER, [spice-controller])]
       [PKG_CHECK_MODULES(SPICE_PROTOCOL, [spice-protocol >= $SPICE_PROTOCOL_REQUIRED])]
       [AC_DEFINE([HAVE_SPICE_GTK], 1, [Have spice-gtk?])]
@@ -237,10 +239,7 @@ AM_CONDITIONAL(ENABLE_UPDATE_MIMEDB, test x$enable_update_mimedb = xyes)
 AC_CONFIG_FILES([
     Makefile
     data/Makefile
-    data/adwaita-icons-needed.wxi
     data/virt-viewer.wxs
-    data/virt-viewer.nsis
-    data/virt-viewer-debug.nsis
     icons/Makefile
     icons/16x16/Makefile
     icons/22x22/Makefile

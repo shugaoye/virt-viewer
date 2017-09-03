@@ -5,21 +5,23 @@ bin_PROGRAMS =
 
 noinst_LTLIBRARIES = libvirt-viewer-util.la libvirt-viewer.la
 
-noinst_DATA =						\
-	virt-viewer.xml				\
-	virt-viewer-about.xml			\
-	virt-viewer-auth.xml			\
-	virt-viewer-guest-details.xml	\
-	virt-viewer-vm-connection.xml	\
-	virt-viewer-preferences.xml		\
-	remote-viewer-connect.xml		\
+noinst_DATA = \
+	resources/ui/virt-viewer.ui \
+	resources/ui/virt-viewer-about.ui \
+	resources/ui/virt-viewer-auth.ui \
+	resources/ui/virt-viewer-guest-details.ui \
+	resources/ui/virt-viewer-vm-connection.ui \
+	resources/ui/virt-viewer-preferences.ui \
+	resources/ui/remote-viewer-connect.ui \
+	resources/ui/remote-viewer-iso-list.ui \
+	resources/ui/virt-viewer-file-transfer-dialog.ui \
 	$(NULL)
 
 EXTRA_DIST =					\
 	$(noinst_DATA)					\
 	virt-viewer-enums.c.etemplate		\
 	virt-viewer-enums.h.etemplate		\
-	virt-viewer.gresource.xml		\
+	resources/virt-viewer.gresource.xml	\
 	$(NULL)
 
 ENUMS_FILES =					\
@@ -33,11 +35,11 @@ BUILT_SOURCES =					\
 	virt-viewer-enums.c			\
 	$(NULL)
 
-virt-viewer-resources.c virt-viewer-resources.h: virt-viewer.gresource.xml Makefile $(shell $(GLIB_COMPILE_RESOURCES) --generate-dependencies --sourcedir $(srcdir) $(srcdir)/virt-viewer.gresource.xml)
-	$(AM_V_GEN) $(GLIB_COMPILE_RESOURCES) --target=$@ --sourcedir=$(srcdir) --generate --c-name virt_viewer $<
+virt-viewer-resources.c virt-viewer-resources.h: resources/virt-viewer.gresource.xml Makefile $(shell $(GLIB_COMPILE_RESOURCES) --generate-dependencies --sourcedir=$(srcdir)/resources $(srcdir)/resources/virt-viewer.gresource.xml)
+	$(AM_V_GEN) $(GLIB_COMPILE_RESOURCES) --target=$@ --sourcedir=$(srcdir)/resources --generate --c-name virt_viewer $<
 
 virt-viewer-enums.c virt-viewer-enums.h: %: %.etemplate $(ENUMS_FILES)
-	$(AM_V_GEN)$(GLIB_MKENUMS) --template $^ | \
+	$(AM_V_GEN)LC_ALL= LANG=C LC_CTYPE=en_US.UTF-8 $(GLIB_MKENUMS) --template $^ | \
             sed -e 's/VIRT_TYPE_VIEWER/VIRT_VIEWER_TYPE/' \
                 -e 's,#include "$(srcdir)/,#include ",' > $@
 
@@ -68,12 +70,8 @@ libvirt_viewer_la_SOURCES =					\
 	virt-viewer-window.c				\
 	virt-viewer-vm-connection.h			\
 	virt-viewer-vm-connection.c			\
-	view/autoDrawer.c				\
-	view/autoDrawer.h				\
-	view/drawer.c					\
-	view/drawer.h					\
-	view/ovBox.c					\
-	view/ovBox.h					\
+	virt-viewer-timed-revealer.c \
+	virt-viewer-timed-revealer.h \
 	$(NULL)
 
 if HAVE_GTK_VNC
@@ -91,6 +89,8 @@ libvirt_viewer_la_SOURCES += \
 	virt-viewer-session-spice.c \
 	virt-viewer-display-spice.h \
 	virt-viewer-display-spice.c \
+	virt-viewer-file-transfer-dialog.h \
+	virt-viewer-file-transfer-dialog.c \
 	$(NULL)
 endif
 
@@ -98,6 +98,8 @@ if HAVE_OVIRT
 libvirt_viewer_la_SOURCES += \
 	ovirt-foreign-menu.h \
 	ovirt-foreign-menu.c \
+	remote-viewer-iso-list-dialog.c \
+	remote-viewer-iso-list-dialog.h \
 	$(NULL)
 endif
 

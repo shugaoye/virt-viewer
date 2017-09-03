@@ -6,8 +6,8 @@ SUBDIRS = icons src man po data tests
 
 AM_DISTCHECK_CONFIGURE_FLAGS = --disable-update-mimedb
 EXTRA_DIST =					\
-	$(PACKAGE).spec				\
-	mingw-$(PACKAGE).spec			\
+	$(PACKAGE).spec	$(PACKAGE).spec.in	\
+	mingw-$(PACKAGE).spec.in		\
 	intltool-extract.in			\
 	intltool-merge.in			\
 	intltool-update.in			\
@@ -18,6 +18,7 @@ EXTRA_DIST =					\
 	build-aux/useless-if-before-free	\
 	build-aux/vc-list-files			\
 	AUTHORS.in				\
+	README.md				\
 	$(NULL)
 
 DISTCLEAN_FILES =				\
@@ -41,7 +42,7 @@ dist-hook: gen-ChangeLog gen-AUTHORS
 # Generate the ChangeLog file (with all entries since the switch to git)
 # and insert it into the directory we're about to use to create a tarball.
 if OS_WIN32
-.PHONY: gen-ChangeLog gen-AUTHORS nsis
+.PHONY: gen-ChangeLog gen-AUTHORS msi
 else
 .PHONY: gen-ChangeLog gen-AUTHORS
 endif
@@ -63,9 +64,9 @@ gen-AUTHORS:
 	fi
 
 if OS_WIN32
-.PHONY: nsis
-nsis:
-	make -C $(builddir)/data virt-viewer-$(VERSION).exe
+.PHONY: msi
+msi:
+	make -C $(builddir)/data msi
 endif
 
 

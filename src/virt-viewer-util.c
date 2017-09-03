@@ -30,7 +30,6 @@
 #ifdef G_OS_WIN32
 #include <windows.h>
 #include <io.h>
-#include <imm.h>
 #endif
 
 #include <sys/types.h>
@@ -51,7 +50,7 @@ virt_viewer_error_quark(void)
 GtkBuilder *virt_viewer_util_load_ui(const char *name)
 {
     GtkBuilder *builder;
-    gchar *resource = g_strdup_printf("%s/%s",
+    gchar *resource = g_strdup_printf("%s/ui/%s",
                                       VIRT_VIEWER_RESOURCE_PREFIX,
                                       name);
 
@@ -253,6 +252,17 @@ static void log_handler(const gchar *log_domain,
     g_log_default_handler(log_domain, log_level, message, unused_data);
 }
 
+#ifdef G_OS_WIN32
+static BOOL is_handle_valid(HANDLE h)
+{
+    if (h == INVALID_HANDLE_VALUE || h == NULL)
+        return FALSE;
+
+    DWORD flags;
+    return GetHandleInformation(h, &flags);
+}
+#endif
+
 void virt_viewer_util_init(const char *appname)
 {
 #ifdef G_OS_WIN32
@@ -265,20 +275,25 @@ void virt_viewer_util_init(const char *appname)
      */
     CreateMutexA(0, 0, "VirtViewerMutex");
 
-    if (AttachConsole(ATTACH_PARENT_PROCESS) != 0) {
-        freopen("CONIN$", "r", stdin);
-        freopen("CONOUT$", "w", stdout);
-        freopen("CONOUT$", "w", stderr);
-        dup2(fileno(stdin), STDIN_FILENO);
-        dup2(fileno(stdout), STDOUT_FILENO);
-        dup2(fileno(stderr), STDERR_FILENO);
-    }
+    /* Get redirection from parent */
+    BOOL out_valid = is_handle_valid(GetStdHandle(STD_OUTPUT_HANDLE));
+    BOOL err_valid = is_handle_valid(GetStdHandle(STD_ERROR_HANDLE));
 
-    /* Disable input method handling so that the Zenkaku_Hankaku can be passed
-     * to VMs rather than being captured by Windows.
-     * https://bugzilla.redhat.com/show_bug.cgi?id=1297640
+    /*
+     * If not all output are redirected try to redirect to parent console.
+     * If parent has no console (for instance as launched from GUI) just
+     * rely on default (no output).
      */
-    ImmDisableIME(-1);
+    if ((!out_valid || !err_valid) && AttachConsole(ATTACH_PARENT_PROCESS)) {
+        if (!out_valid) {
+            freopen("CONOUT$", "w", stdout);
+            dup2(fileno(stdout), STDOUT_FILENO);
+        }
+        if (!err_valid) {
+            freopen("CONOUT$", "w", stderr);
+            dup2(fileno(stderr), STDERR_FILENO);
+        }
+    }
 #endif
 
     setlocale(LC_ALL, "");
@@ -294,7 +309,7 @@ void virt_viewer_util_init(const char *appname)
 static gchar *
 ctrl_key_to_gtk_key(const gchar *key)
 {
-    int i;
+    guint i;
 
     static const struct {
         const char *ctrl;
@@ -506,6 +521,7 @@ displays_cmp(const void *p1, const void *p2, gpointer user_data)
     guint j = *(guint*)p2;
     GdkRectangle *m1 = g_hash_table_lookup(displays, GINT_TO_POINTER(i));
     GdkRectangle *m2 = g_hash_table_lookup(displays, GINT_TO_POINTER(j));
+    g_return_val_if_fail(m1 != NULL && m2 != NULL, 0);
     diff = m1->x - m2->x;
     if (diff == 0)
         diff = m1->y - m2->y;
@@ -527,7 +543,8 @@ static void find_max_id(gpointer key,
 void
 virt_viewer_align_monitors_linear(GHashTable *displays)
 {
-    gint i, x = 0;
+    guint i;
+    gint x = 0;
     guint *sorted_displays;
     guint max_id = 0;
     guint ndisplays = 0;
@@ -556,6 +573,7 @@ virt_viewer_align_monitors_linear(GHashTable *displays)
         guint nth = sorted_displays[i];
         g_assert(nth < ndisplays);
         GdkRectangle *rect = g_hash_table_lookup(displays, GINT_TO_POINTER(nth));
+        g_return_if_fail(rect != NULL);
         rect->x = x;
         rect->y = 0;
         x += rect->width;
@@ -588,6 +606,7 @@ virt_viewer_shift_monitors_to_origin(GHashTable *displays)
     g_hash_table_iter_init(&iter, displays);
     while (g_hash_table_iter_next(&iter, NULL, &value)) {
         GdkRectangle *display = value;
+        g_return_if_fail(display != NULL);
         if (display->width > 0 && display->height > 0) {
             xmin = MIN(xmin, display->x);
             ymin = MIN(ymin, display->y);
@@ -623,11 +642,14 @@ virt_viewer_shift_monitors_to_origin(GHashTable *displays)
 GHashTable*
 virt_viewer_parse_monitor_mappings(gchar **mappings, const gsize nmappings, const gint nmonitors)
 {
-    GHashTable *displaymap = g_hash_table_new(g_direct_hash, g_direct_equal);
-    GHashTable *monitormap = g_hash_table_new(g_direct_hash, g_direct_equal);
-    gint i, max_display_id = 0;
+    GHashTable *displaymap;
+    GHashTable *monitormap;
+    guint i, max_display_id = 0;
     gchar **tokens = NULL;
 
+    g_return_val_if_fail(nmonitors != 0, NULL);
+    displaymap = g_hash_table_new(g_direct_hash, g_direct_equal);
+    monitormap = g_hash_table_new(g_direct_hash, g_direct_equal);
     if (nmappings == 0) {
         g_warning("Empty monitor-mapping configuration");
         goto configerror;
@@ -677,7 +699,7 @@ virt_viewer_parse_monitor_mappings(gchar **mappings, const gsize nmappings, cons
         g_debug("Fullscreen config: mapping guest display %i to monitor %i", display, monitor);
         g_hash_table_insert(displaymap, GINT_TO_POINTER(display), GINT_TO_POINTER(monitor));
         g_hash_table_insert(monitormap, GINT_TO_POINTER(monitor), GINT_TO_POINTER(display));
-        max_display_id = MAX(display, max_display_id);
+        max_display_id = MAX((guint) display, max_display_id);
     }
 
     for (i = 0; i < max_display_id; i++) {
